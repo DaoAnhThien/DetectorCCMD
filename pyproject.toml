@@ -1,0 +1,10 @@
+[project]
+name = "detectorccmd"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pefile>=2024.8.26",
+    "watchdog>=6.0.0",
+]
