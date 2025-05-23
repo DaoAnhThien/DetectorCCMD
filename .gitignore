@@ -1,3 +1,5 @@
 .venv/
 uv.lock
 .vs/
+SysinternalsSuite/
+*.pyc
