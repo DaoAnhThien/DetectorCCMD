@@ -6,5 +6,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "pefile>=2024.8.26",
+    "psutil>=7.0.0",
     "watchdog>=6.0.0",
 ]
