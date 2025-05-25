@@ -7,6 +7,10 @@ import logging
 import threading
 import psutil
 import win32api
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import importlib
+file_encryption_detector = importlib.import_module('file-encryption-detector')
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -55,7 +59,7 @@ def check_for_exe_files(folder_path, folder_name):
                     logger.info(f"Found .exe file: {exe_path}")
                     # Analyze DLL dependencies for the .exe file
                     analyze_exe_dependencies(exe_path)
-        
+
         if not exe_found:
             logger.info(f"No .exe files found in {folder_path} or its subfolders.")
 
@@ -133,7 +137,7 @@ def compare_dll_metadata(dll_path, system32_path):
     try:
         dll_meta = get_dll_metadata(dll_path)
         system_meta = get_dll_metadata(system32_path)
-        
+
         differences = []
         if dll_meta['version'] != system_meta['version']:
             differences.append(f"Version mismatch: {dll_meta['version']} vs {system_meta['version']}")
@@ -141,13 +145,28 @@ def compare_dll_metadata(dll_path, system32_path):
             differences.append(f"File size mismatch: {dll_meta['file_size']} bytes vs {system_meta['file_size']} bytes")
         if dll_meta['creation_time'] != system_meta['creation_time']:
             differences.append(f"Creation time mismatch: {dll_meta['creation_time']} vs {system_meta['creation_time']}")
-        
+
         if differences:
             logger.critical(f"DLL metadata differences detected for {dll_path}: {'; '.join(differences)}")
         return differences
     except Exception as e:
         logger.error(f"Error comparing metadata for {dll_path} and {system32_path}: {e}")
         return []
+
+# Track running encryption detectors by pid
+active_encryption_detectors = {}
+
+def kill_process_by_pid(pid):
+    """Kill a process by PID using pskill64.exe from needed-sysinternal."""
+    import subprocess
+    pskill_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'needed-sysinternal', 'pskill64.exe')
+    try:
+        result = subprocess.run([
+            pskill_path, str(pid)
+        ], capture_output=True, text=True, shell=True)
+        logger.critical(f"Process {pid} killed using pskill64.exe. Output: {result.stdout}")
+    except Exception as e:
+        logger.error(f"Failed to kill process {pid} with pskill64.exe: {e}")
 
 def monitor_processes(watch_dir, sysinternals_dir):
     """Continuously monitor for new processes whose EXE is inside watch_dir, and use Listdlls to list runtime DLLs."""
@@ -165,6 +184,13 @@ def monitor_processes(watch_dir, sysinternals_dir):
                     if os.path.commonpath([os.path.abspath(exe), os.path.abspath(watch_dir)]) == os.path.abspath(watch_dir):
                         seen_pids.add(pid)
                         logger.info(f"New process detected: {exe} (PID {pid})")
+                        # Start monitoring for encryption-like activity
+                        def on_encryption_detected(sus_pid):
+                            kill_process_by_pid(sus_pid)
+                        detector = file_encryption_detector.monitor_encryption_activity(
+                            watch_dir, pid, on_encryption_detected, extensions=['.notwncry'], interval=1, threshold=1
+                        )
+                        active_encryption_detectors[pid] = detector
                         try:
                             import subprocess
                             result = subprocess.run([
@@ -270,7 +296,7 @@ def main():
     # Specify the directory to monitor
     watch_dir = "D:\\Downloads\\HK6\\NT230CCMD\\Detector\\test"
     sysinternals_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'needed-sysinternal')
-    logger.info(f"Starting to monitor directory: {watch_dir}")  
+    logger.info(f"Starting to monitor directory: {watch_dir}")
     # Start monitoring processes in a separate thread
     threading.Thread(target=monitor_processes, args=(watch_dir, sysinternals_dir), daemon=True).start()
     # Start monitoring the directory
