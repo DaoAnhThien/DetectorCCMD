@@ -6,6 +6,7 @@ from watchdog.events import FileSystemEventHandler
 import logging
 import threading
 import psutil
+import win32api
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -93,27 +94,60 @@ def analyze_exe_dependencies(exe_path):
     except Exception as e:
         logger.error(f"Error analyzing {exe_path}: {str(e)}")
 
-def monitor_directory(watch_dir):
-    # Ensure the directory exists
-    if not os.path.isdir(watch_dir):
-        logger.error(f"Directory {watch_dir} does not exist.")
-        return
-
-    # Initialize the event handler and observer
-    event_handler = FolderCreationHandler(watch_dir)
-    observer = Observer()
-    observer.schedule(event_handler, watch_dir, recursive=False)
-    observer.start()
-
+def get_dll_exports(dll_path):
+    """Return a set of exported function names and their ordinals from a DLL using pefile."""
     try:
-        logger.info(f"Monitoring directory {watch_dir} for new folders. Press Ctrl+C to stop.")
-        while True:
-            time.sleep(1)  # Keep the script running to monitor events
-    except KeyboardInterrupt:
-        logger.info("Monitoring stopped by user.")
-    finally:
-        observer.stop()
-        observer.join()
+        pe = pefile.PE(dll_path)
+        exports = set()
+        if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT') and pe.DIRECTORY_ENTRY_EXPORT:
+            for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                if exp.name:
+                    # Include both name and ordinal for more precise comparison
+                    exports.add((exp.name.decode('utf-8', errors='ignore'), exp.ordinal))
+                else:
+                    # Include unnamed exports by ordinal only
+                    exports.add(('', exp.ordinal))
+        return exports
+    except Exception as e:
+        logger.error(f"Error reading exports from {dll_path}: {e}")
+        return set()
+
+def get_dll_metadata(dll_path):
+    """Return metadata (file size, version, creation time) for a DLL."""
+    try:
+        file_info = win32api.GetFileVersionInfo(dll_path, '\\')
+        version = f"{file_info['FileVersionMS'] >> 16}.{file_info['FileVersionMS'] & 0xFFFF}.{file_info['FileVersionLS'] >> 16}.{file_info['FileVersionLS'] & 0xFFFF}"
+        file_size = os.path.getsize(dll_path)
+        creation_time = time.ctime(os.path.getctime(dll_path))
+        return {
+            'version': version,
+            'file_size': file_size,
+            'creation_time': creation_time
+        }
+    except Exception as e:
+        logger.error(f"Error retrieving metadata for {dll_path}: {e}")
+        return {'version': 'Unknown', 'file_size': 0, 'creation_time': 'Unknown'}
+
+def compare_dll_metadata(dll_path, system32_path):
+    """Compare metadata between a DLL and its System32 counterpart."""
+    try:
+        dll_meta = get_dll_metadata(dll_path)
+        system_meta = get_dll_metadata(system32_path)
+        
+        differences = []
+        if dll_meta['version'] != system_meta['version']:
+            differences.append(f"Version mismatch: {dll_meta['version']} vs {system_meta['version']}")
+        if abs(dll_meta['file_size'] - system_meta['file_size']) > 1024:  # Allow 1KB difference
+            differences.append(f"File size mismatch: {dll_meta['file_size']} bytes vs {system_meta['file_size']} bytes")
+        if dll_meta['creation_time'] != system_meta['creation_time']:
+            differences.append(f"Creation time mismatch: {dll_meta['creation_time']} vs {system_meta['creation_time']}")
+        
+        if differences:
+            logger.critical(f"DLL metadata differences detected for {dll_path}: {'; '.join(differences)}")
+        return differences
+    except Exception as e:
+        logger.error(f"Error comparing metadata for {dll_path} and {system32_path}: {e}")
+        return []
 
 def monitor_processes(watch_dir, sysinternals_dir):
     """Continuously monitor for new processes whose EXE is inside watch_dir, and use Listdlls to list runtime DLLs."""
@@ -155,6 +189,8 @@ def monitor_processes(watch_dir, sysinternals_dir):
                                     publisher = ''
                                     description = ''
                                     product = ''
+                                    file_version = 'Unknown'
+                                    create_time = 'Unknown'
                                     for l in block:
                                         if l.strip().startswith('Publisher:'):
                                             publisher = l.split(':',1)[-1].strip()
@@ -171,14 +207,34 @@ def monitor_processes(watch_dir, sysinternals_dir):
                                         logger.critical(f"Suspicious DLL found: {info_line}")
                                     else:
                                         logger.warning(f"Caution with this unsigned DLL: {info_line}")
-                                    # DLL proxying detection: compare exports with original
+                                    # DLL proxying detection: compare exports and metadata with original
                                     dll_name = os.path.basename(path)
                                     system32_path = os.path.join(os.environ.get('SystemRoot', r'C:\\Windows'), 'System32', dll_name)
                                     if os.path.isfile(system32_path) and os.path.isfile(path):
+                                        # Compare exports
                                         unsigned_exports = get_dll_exports(path)
                                         original_exports = get_dll_exports(system32_path)
                                         if unsigned_exports != original_exports:
-                                            logger.critical(f"DLL proxying detected: {path} exports differ from {system32_path}. Unsigned exports: {sorted(unsigned_exports)}. Original exports: {sorted(original_exports)}")
+                                            # Log specific differences
+                                            unsigned_names = {name for name, ordinal in unsigned_exports}
+                                            original_names = {name for name, ordinal in original_exports}
+                                            missing_in_unsigned = original_names - unsigned_names
+                                            extra_in_unsigned = unsigned_names - original_names
+                                            ordinal_mismatches = {
+                                                name for name, ordinal in unsigned_exports
+                                                for orig_name, orig_ordinal in original_exports
+                                                if name == orig_name and ordinal != orig_ordinal
+                                            }
+                                            diff_log = []
+                                            if missing_in_unsigned:
+                                                diff_log.append(f"Missing exports: {sorted(missing_in_unsigned)}")
+                                            if extra_in_unsigned:
+                                                diff_log.append(f"Extra exports: {sorted(extra_in_unsigned)}")
+                                            if ordinal_mismatches:
+                                                diff_log.append(f"Ordinal mismatches: {sorted(ordinal_mismatches)}")
+                                            logger.critical(f"DLL proxying detected: {path} exports differ from {system32_path}. {'; '.join(diff_log)}")
+                                        # Compare metadata
+                                        compare_dll_metadata(path, system32_path)
                         except Exception as e:
                             logger.error(f"Error running Listdlls for PID {pid}: {e}")
                 except Exception:
@@ -188,31 +244,37 @@ def monitor_processes(watch_dir, sysinternals_dir):
             logger.error(f"Error in process monitor: {e}")
             time.sleep(5)
 
-def get_dll_exports(dll_path):
-    """Return a set of exported function names from a DLL using pefile."""
+def monitor_directory(watch_dir):
+    # Ensure the directory exists
+    if not os.path.isdir(watch_dir):
+        logger.error(f"Directory {watch_dir} does not exist.")
+        return
+
+    # Initialize the event handler and observer
+    event_handler = FolderCreationHandler(watch_dir)
+    observer = Observer()
+    observer.schedule(event_handler, watch_dir, recursive=False)
+    observer.start()
+
     try:
-        import pefile
-        pe = pefile.PE(dll_path)
-        exports = set()
-        if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT') and pe.DIRECTORY_ENTRY_EXPORT:
-            for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
-                if exp.name:
-                    exports.add(exp.name.decode('utf-8', errors='ignore'))
-        return exports
-    except Exception as e:
-        logger.error(f"Error reading exports from {dll_path}: {e}")
-        return set()
+        logger.info(f"Monitoring directory {watch_dir} for new folders. Press Ctrl+C to stop.")
+        while True:
+            time.sleep(1)  # Keep the script running to monitor events
+    except KeyboardInterrupt:
+        logger.info("Monitoring stopped by user.")
+    finally:
+        observer.stop()
+        observer.join()
 
 def main():
-    # Specify the directory to monitor, 
-    watch_dir = "C:\\Users\\JakeClark\\Downloads"  # Change this to your target directory
+    # Specify the directory to monitor
+    watch_dir = "D:\\Downloads\\HK6\\NT230CCMD\\Detector\\test"
     sysinternals_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'needed-sysinternal')
     logger.info(f"Starting to monitor directory: {watch_dir}")  
-    # Start monitoring the directory
+    # Start monitoring processes in a separate thread
     threading.Thread(target=monitor_processes, args=(watch_dir, sysinternals_dir), daemon=True).start()
+    # Start monitoring the directory
     monitor_directory(watch_dir)
-    # Start monitoring processes
-    #monitor_processes(watch_dir, sysinternals_dir)
 
 if __name__ == "__main__":
     main()
