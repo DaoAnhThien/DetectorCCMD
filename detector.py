@@ -7,14 +7,23 @@ import logging
 import threading
 import psutil
 import win32api
+import subprocess
+import winreg
 import sys
+import pandas as pd
+import io
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import importlib
 file_encryption_detector = importlib.import_module('file-encryption-detector')
+smb_propagation_detector = importlib.import_module('smb_propagation_detector')
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger()
+
+# Global dictionary to track suspicious processes
+# Format: {pid: {'exe_path': str, 'suspicious_dlls': [{'dll_path': str, 'original_dll': str}]}}
+suspicious_processes = {}
 
 class FolderCreationHandler(FileSystemEventHandler):
     def __init__(self, watch_dir):
@@ -51,7 +60,6 @@ def check_for_exe_files(folder_path, folder_name):
         # Walk through the folder to find .exe files
         exe_found = False
         for root, dirs, files in os.walk(folder_path):
-            logger.info(f"Scanning directory: {root}")
             for file in files:
                 if file.lower().endswith('.exe'):
                     exe_found = True
@@ -61,7 +69,7 @@ def check_for_exe_files(folder_path, folder_name):
                     analyze_exe_dependencies(exe_path)
 
         if not exe_found:
-            logger.info(f"No .exe files found in {folder_path} or its subfolders.")
+            logger.info(f"No .exe files found in {folder_path}")
 
     except Exception as e:
         logger.error(f"Error checking for .exe files in {folder_path}: {str(e)}")
@@ -147,7 +155,7 @@ def compare_dll_metadata(dll_path, system32_path):
             differences.append(f"Creation time mismatch: {dll_meta['creation_time']} vs {system_meta['creation_time']}")
 
         if differences:
-            logger.critical(f"DLL metadata differences detected for {dll_path}: {'; '.join(differences)}")
+            logger.critical(f"DLL metadata mismatch: {dll_path} - {'; '.join(differences)}")
         return differences
     except Exception as e:
         logger.error(f"Error comparing metadata for {dll_path} and {system32_path}: {e}")
@@ -155,6 +163,53 @@ def compare_dll_metadata(dll_path, system32_path):
 
 # Track running encryption detectors by pid
 active_encryption_detectors = {}
+
+def monitor_encryption_for_process(watch_dir, pid, exe_path):
+    """Monitor encryption activity for a specific process in a separate thread."""
+    def on_encryption_detected(sus_pid):
+        logger.critical(f"ENCRYPTION DETECTED: Process {sus_pid} ({exe_path}) is encrypting files!")
+        kill_process_by_pid(sus_pid)
+        # Clean up the detector
+        if sus_pid in active_encryption_detectors:
+            del active_encryption_detectors[sus_pid]
+    
+    try:
+        detector = file_encryption_detector.monitor_encryption_activity(
+            watch_dir, pid, on_encryption_detected, extensions=['.notwncry'], interval=0.5, threshold=1
+        )
+        active_encryption_detectors[pid] = detector
+        logger.info(f"Started encryption monitoring for PID {pid}")
+    except Exception as e:
+        logger.error(f"Failed to start encryption monitoring for PID {pid}: {e}")
+
+def cleanup_dead_processes():
+    """Clean up encryption detectors for processes that no longer exist."""
+    dead_pids = []
+    for pid in active_encryption_detectors.keys():
+        try:
+            psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            dead_pids.append(pid)
+    
+    for pid in dead_pids:
+        del active_encryption_detectors[pid]
+        if pid in suspicious_processes:
+            del suspicious_processes[pid]
+        logger.info(f"Cleaned up monitoring for dead process PID {pid}")
+
+def add_suspicious_process(pid, exe_path, dll_path, original_dll=None):
+    """Add a suspicious process to the tracking dictionary."""
+    if pid not in suspicious_processes:
+        suspicious_processes[pid] = {
+            'exe_path': exe_path,
+            'suspicious_dlls': []
+        }
+    
+    suspicious_processes[pid]['suspicious_dlls'].append({
+        'dll_path': dll_path,
+        'original_dll': original_dll
+    })
+    logger.critical(f"Added suspicious process tracking: PID {pid}, EXE: {exe_path}, DLL: {dll_path}, Original: {original_dll}")
 
 def kill_process_by_pid(pid):
     """Kill a process by PID using pskill64.exe from needed-sysinternal."""
@@ -173,8 +228,16 @@ def monitor_processes(watch_dir, sysinternals_dir):
     seen_pids = set()
     listdlls_path = os.path.join(sysinternals_dir, 'Listdlls.exe' if os.name == 'nt' and os.environ.get('PROCESSOR_ARCHITECTURE', '').endswith('64') else 'Listdlls.exe')
     logger.info(f"Using Listdlls: {listdlls_path}")
+    cleanup_counter = 0
+    
     while True:
         try:
+            # Periodic cleanup of dead processes (every 30 iterations)
+            cleanup_counter += 1
+            if cleanup_counter >= 30:
+                cleanup_dead_processes()
+                cleanup_counter = 0
+            
             for proc in psutil.process_iter(['pid', 'exe', 'name']):
                 pid = proc.info['pid']
                 exe = proc.info['exe']
@@ -184,13 +247,8 @@ def monitor_processes(watch_dir, sysinternals_dir):
                     if os.path.commonpath([os.path.abspath(exe), os.path.abspath(watch_dir)]) == os.path.abspath(watch_dir):
                         seen_pids.add(pid)
                         logger.info(f"New process detected: {exe} (PID {pid})")
-                        # Start monitoring for encryption-like activity
-                        def on_encryption_detected(sus_pid):
-                            kill_process_by_pid(sus_pid)
-                        detector = file_encryption_detector.monitor_encryption_activity(
-                            watch_dir, pid, on_encryption_detected, extensions=['.notwncry'], interval=1, threshold=1
-                        )
-                        active_encryption_detectors[pid] = detector
+                        
+                        # First run Listdlls to analyze DLLs
                         try:
                             import subprocess
                             result = subprocess.run([
@@ -228,11 +286,13 @@ def monitor_processes(watch_dir, sysinternals_dir):
                                             file_version = l.split(':',1)[-1].strip()
                                         elif l.strip().startswith('Create time:'):
                                             create_time = l.split(':',1)[-1].strip()
-                                    info_line = f"{path} | unsigned | publisher: {publisher} | description: {description} | product: {product} | file version: {file_version} | create time: {create_time}"
+                                    info_line = f"{path} | unsigned | publisher: {publisher} | description: {description} | product: {product}"
                                     if (not publisher or publisher.lower() == 'n/a') and (not description or description.lower() == 'n/a'):
                                         logger.critical(f"Suspicious DLL found: {info_line}")
+                                        # Track the suspicious process
+                                        add_suspicious_process(pid, exe, path)
                                     else:
-                                        logger.warning(f"Caution with this unsigned DLL: {info_line}")
+                                        logger.warning(f"Unsigned DLL: {info_line}")
                                     # DLL proxying detection: compare exports and metadata with original
                                     dll_name = os.path.basename(path)
                                     system32_path = os.path.join(os.environ.get('SystemRoot', r'C:\\Windows'), 'System32', dll_name)
@@ -241,34 +301,237 @@ def monitor_processes(watch_dir, sysinternals_dir):
                                         unsigned_exports = get_dll_exports(path)
                                         original_exports = get_dll_exports(system32_path)
                                         if unsigned_exports != original_exports:
-                                            # Log specific differences
-                                            unsigned_names = {name for name, ordinal in unsigned_exports}
-                                            original_names = {name for name, ordinal in original_exports}
-                                            missing_in_unsigned = original_names - unsigned_names
-                                            extra_in_unsigned = unsigned_names - original_names
-                                            ordinal_mismatches = {
-                                                name for name, ordinal in unsigned_exports
-                                                for orig_name, orig_ordinal in original_exports
-                                                if name == orig_name and ordinal != orig_ordinal
-                                            }
-                                            diff_log = []
-                                            if missing_in_unsigned:
-                                                diff_log.append(f"Missing exports: {sorted(missing_in_unsigned)}")
-                                            if extra_in_unsigned:
-                                                diff_log.append(f"Extra exports: {sorted(extra_in_unsigned)}")
-                                            if ordinal_mismatches:
-                                                diff_log.append(f"Ordinal mismatches: {sorted(ordinal_mismatches)}")
-                                            logger.critical(f"DLL proxying detected: {path} exports differ from {system32_path}. {'; '.join(diff_log)}")
+                                            logger.critical(f"DLL proxying detected: {path} exports differ from {system32_path}")
+                                            # Track the suspicious process with DLL proxying info
+                                            add_suspicious_process(pid, exe, path, system32_path)
                                         # Compare metadata
                                         compare_dll_metadata(path, system32_path)
                         except Exception as e:
                             logger.error(f"Error running Listdlls for PID {pid}: {e}")
+                        
+                        # After DLL analysis, start monitoring for encryption-like activity in separate thread
+                        threading.Thread(
+                            target=monitor_encryption_for_process, 
+                            args=(watch_dir, pid, exe), 
+                            daemon=True
+                        ).start()
                 except Exception:
                     continue
             time.sleep(2)
         except Exception as e:
             logger.error(f"Error in process monitor: {e}")
             time.sleep(5)
+
+def monitor_persistence(sysinternals_dir):
+    """Monitor autorun persistence using autorunsc.exe and delete suspicious entries."""
+    autorunsc_path = os.path.join(sysinternals_dir, 'autorunsc.exe')
+    logger.info(f"Starting persistence monitor using: {autorunsc_path}")
+    
+    while True:
+        try:
+            # Run autorunsc.exe to get autorun entries in CSV format
+            result = subprocess.run([
+                autorunsc_path, '-accepteula', '-c', '-h', '-s'
+            ], capture_output=True, shell=True)
+            
+            if result.returncode != 0:
+                logger.error(f"Autorunsc failed with return code {result.returncode}")
+                time.sleep(30)
+                continue
+            
+            # Handle Unicode BOM and decode output properly
+            try:
+                # First try UTF-16 with BOM handling
+                raw_output = result.stdout
+                if raw_output.startswith(b'\xff\xfe'):  # UTF-16 LE BOM
+                    output_text = raw_output.decode('utf-16')
+                elif raw_output.startswith(b'\xfe\xff'):  # UTF-16 BE BOM
+                    output_text = raw_output.decode('utf-16')
+                else:
+                    # Try UTF-8 first, fallback to latin-1
+                    try:
+                        output_text = raw_output.decode('utf-8')
+                    except UnicodeDecodeError:
+                        output_text = raw_output.decode('latin-1')
+                
+                # Remove BOM if present
+                if output_text.startswith('\ufeff'):
+                    output_text = output_text[1:]
+                
+                # Find the start of CSV data by looking for header with "Time" and "Entry Location"
+                output_lines = output_text.splitlines()
+                csv_start_index = -1
+                
+                for i, line in enumerate(output_lines):
+                    line_clean = line.strip()
+                    # Look for CSV header containing the key columns
+                    if ('Time' in line_clean and 'Entry Location' in line_clean and 
+                        'Entry' in line_clean and 'Image Path' in line_clean):
+                        csv_start_index = i
+                        break
+                
+                if csv_start_index == -1:
+                    logger.warning("Could not find CSV header in autorunsc output")
+                    time.sleep(10)
+                    continue
+                
+                # Extract only the CSV portion (header + data)
+                csv_lines = output_lines[csv_start_index:]
+                csv_content = '\n'.join(csv_lines)
+                
+                # Use pandas to parse CSV with proper error handling
+                csv_data = io.StringIO(csv_content)
+                df = pd.read_csv(csv_data, sep=',', on_bad_lines='skip', encoding='utf-8')
+                
+                # logger.info(f"Parsed {len(df)} autorun entries. Columns: {list(df.columns)}")
+                
+                # Check if we have the expected columns (handle different column name variations)
+                image_path_col = None
+                entry_location_col = None
+                entry_col = None
+                launch_string_col = None
+                
+                for col in df.columns:
+                    col_lower = col.lower().strip()
+                    if 'image path' in col_lower or 'imagepath' in col_lower:
+                        image_path_col = col
+                    elif 'entry location' in col_lower or 'entrylocation' in col_lower:
+                        entry_location_col = col
+                    elif col_lower == 'entry':
+                        entry_col = col
+                    elif 'launch string' in col_lower or 'launchstring' in col_lower:
+                        launch_string_col = col
+                
+                if not image_path_col:
+                    logger.warning("Image Path column not found in autorunsc output")
+                    time.sleep(10)
+                    continue
+                
+                # Filter rows that have valid image paths
+                df = df.dropna(subset=[image_path_col])
+                
+                # Create corrected image path column using Launch String when Image Path is invalid
+                def get_correct_path(row):
+                    image_path = row[image_path_col]
+                    if pd.isna(image_path) or 'file not found:' in str(image_path).lower():
+                        # Use Launch String as fallback
+                        if launch_string_col and not pd.isna(row[launch_string_col]):
+                            return str(row[launch_string_col]).lower()
+                    return str(image_path).lower()
+                
+                df['Image_Path_Lower'] = df.apply(get_correct_path, axis=1)
+                
+                # Create Launch_String_Lower column for consistent searching
+                if launch_string_col:
+                    df['Launch_String_Lower'] = df[launch_string_col].str.lower()
+                else:
+                    df['Launch_String_Lower'] = None
+
+                
+
+                # Define a clear path comparison function
+                def compare_paths_with_exe(row, target_exe_path):
+                    """
+                    Compare Image Path and Launch String against target exe path.
+                    Returns True if either path contains the target exe path.
+                    """
+                    target_exe_lower = target_exe_path.lower().replace('\\', '\\\\')
+                    # logger.debug(f"Comparing row: {repr(target_exe_path)}")
+                    # Check Image Path (already processed with fallback lo
+                    image_path_lower = row['Image_Path_Lower'].lower().replace('\\', '\\\\')
+                    # Log the comparison for debugging
+                    # logger.debug(f"Comparing Image Path: {image_path_lower} with target exe: {target_exe_lower}")
+                    # If Image Path is valid and contains the target exe path
+                    if pd.notna(image_path_lower) and target_exe_lower in str(image_path_lower):
+                        return True
+                    
+                    # Check Launch String if available
+                    # Log the comparison for debugging
+                    # logger.debug(f"Comparing Launch String: {row['Launch_String_Lower']} with target exe: {target_exe_lower}")
+                    # If Launch String is available and contains the target exe path
+                    if launch_string_col and pd.notna(row['Launch_String_Lower']):
+                        launch_string_lower = row['Launch_String_Lower'].lower().replace('\\', '\\\\')
+                        if target_exe_lower in str(launch_string_lower):
+                            return True
+                    
+                    return False
+                
+                # Check against suspicious processes
+                # logger.info(f"Checking autorun entries against suspicious processes...{suspicious_processes.items()}")
+                for pid, info in suspicious_processes.items():
+                    exe_path = info['exe_path']
+                    exe_dir = os.path.dirname(exe_path.lower())
+                    
+                    # Apply the comparison function to the DataFrame
+                    df['path_matches'] = df.apply(compare_paths_with_exe, target_exe_path=exe_path, axis=1)
+                    
+                    # Log results with index and boolean outcome
+                    for idx, row in df.iterrows():
+                        if row['path_matches']:
+                            logger.debug(f"Index {idx}: Path comparison result = {row['path_matches']} for exe_path: {exe_path}")
+                    
+                    # Print last few autorun entries for debugging
+                    logger.debug(f"Last few autorun entries:\n{df.iloc[-1].to_dict()}")
+
+                    # Get matching entries using the new function results
+                    matching_entries = df[df['path_matches']]
+                    logger.info(f"Found {len(matching_entries)} matching autorun entries for PID {pid} ({exe_path})")
+                    
+                    for _, row in matching_entries.iterrows():
+                        # Check if suspicious DLL exists in same folder
+                        suspicious_dll_in_folder = False
+                        for dll_info in info['suspicious_dlls']:
+                            dll_path = dll_info['dll_path'].lower()
+                            dll_dir = os.path.dirname(dll_path)
+                            if dll_dir == exe_dir:
+                                suspicious_dll_in_folder = True
+                                break
+                        
+                        if suspicious_dll_in_folder:
+                                logger.critical(f"Suspicious autorun entry detected: {row[entry_col] if entry_col else 'Unknown'} at {row[entry_location_col] if entry_location_col else 'Unknown'} pointing to {row[image_path_col]}")
+                                
+                                # Attempt to delete the registry entry
+                                if entry_location_col and entry_col:
+                                    try:
+                                        location = row[entry_location_col]
+                                        entry_name = row[entry_col]
+                                        
+                                        if location.startswith('HKLM'):
+                                            root_key = winreg.HKEY_LOCAL_MACHINE
+                                            subkey_path = location[5:]  # Remove 'HKLM\'
+                                        elif location.startswith('HKCU'):
+                                            root_key = winreg.HKEY_CURRENT_USER
+                                            subkey_path = location[5:]  # Remove 'HKCU\'
+                                        else:
+                                            logger.warning(f"Unknown registry root in {location}")
+                                            continue
+                                        
+                                        # Try to delete the registry value
+                                        try:
+                                            with winreg.OpenKey(root_key, subkey_path, 0, winreg.KEY_SET_VALUE) as key:
+                                                winreg.DeleteValue(key, entry_name)
+                                            logger.critical(f"Successfully deleted autorun registry entry: {entry_name} from {location}")
+                                        except FileNotFoundError:
+                                            logger.warning(f"Registry key or value not found: {location}\\{entry_name}")
+                                        except PermissionError:
+                                            logger.error(f"Permission denied deleting registry entry: {location}\\{entry_name}")
+                                        except Exception as reg_e:
+                                            logger.error(f"Error deleting registry entry {location}\\{entry_name}: {reg_e}")
+                                            
+                                    except Exception as e:
+                                        logger.error(f"Error processing autorun entry {location}: {e}")
+                
+            except Exception as csv_e:
+                logger.error(f"Error parsing autorunsc CSV output: {csv_e}")
+                # Log first few lines of output for debugging
+                if 'output_text' in locals():
+                    lines_preview = output_text.splitlines()[:10]
+                    logger.debug(f"First 10 lines of autorunsc output: {lines_preview}")
+            
+            time.sleep(10)  # Check every 10 seconds
+        except Exception as e:
+            logger.error(f"Error in persistence monitor: {e}")
+            time.sleep(30)
 
 def monitor_directory(watch_dir):
     # Ensure the directory exists
@@ -294,11 +557,15 @@ def monitor_directory(watch_dir):
 
 def main():
     # Specify the directory to monitor
-    watch_dir = "D:\\Downloads\\HK6\\NT230CCMD\\Detector\\test"
+    watch_dir = "C:\\Users\\JakeClark\\Downloads"
     sysinternals_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'needed-sysinternal')
     logger.info(f"Starting to monitor directory: {watch_dir}")
     # Start monitoring processes in a separate thread
     threading.Thread(target=monitor_processes, args=(watch_dir, sysinternals_dir), daemon=True).start()
+    # Start monitoring persistence in a separate thread
+    threading.Thread(target=monitor_persistence, args=(sysinternals_dir,), daemon=True).start()
+    # Start SMB propagation detection in a separate thread
+    threading.Thread(target=smb_propagation_detector.start_smb_propagation_detector, args=(suspicious_processes, sysinternals_dir), daemon=True).start()
     # Start monitoring the directory
     monitor_directory(watch_dir)
 

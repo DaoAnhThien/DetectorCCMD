@@ -1,0 +1,14 @@
+2025-05-26 19:45:00,100 - INFO - Starting SMB propagation detector
+2025-05-26 19:45:00,203 - INFO - Starting network share cleanup monitoring
+2025-05-26 19:45:19,540 - INFO - Starting SMB propagation detector
+2025-05-26 19:45:19,556 - INFO - Starting network share cleanup monitoring
+2025-05-26 19:45:34,576 - INFO - Starting SMB monitoring for PID 9616 (C:\Users\JakeClark\Downloads\unikey46RC2-230919-win64\UniKeyNT.exe)
+2025-05-26 19:45:34,600 - INFO - Stopped SMB monitoring for PID 9616
+2025-05-26 19:45:39,580 - INFO - Starting SMB monitoring for PID 9616 (C:\Users\JakeClark\Downloads\unikey46RC2-230919-win64\UniKeyNT.exe)
+2025-05-26 19:45:39,580 - INFO - Stopped SMB monitoring for PID 9616
+2025-05-26 19:45:44,587 - INFO - Starting SMB monitoring for PID 9616 (C:\Users\JakeClark\Downloads\unikey46RC2-230919-win64\UniKeyNT.exe)
+2025-05-26 19:45:44,603 - INFO - Stopped SMB monitoring for PID 9616
+2025-05-26 19:45:49,602 - INFO - Starting SMB monitoring for PID 9616 (C:\Users\JakeClark\Downloads\unikey46RC2-230919-win64\UniKeyNT.exe)
+2025-05-26 19:45:49,602 - INFO - Stopped SMB monitoring for PID 9616
+2025-05-26 19:45:54,606 - INFO - Starting SMB monitoring for PID 9616 (C:\Users\JakeClark\Downloads\unikey46RC2-230919-win64\UniKeyNT.exe)
+2025-05-26 19:45:54,606 - INFO - Stopped SMB monitoring for PID 9616
